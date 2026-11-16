@@ -1,0 +1,294 @@
+# 2026-11-16 rerun (ci/sasha-sample-411): base = google-ai-edge/litert-samples main 6bfa91e;
+#   A  main as is (3.9.3 + patch);  F  commit 5655af8, flutter_litert ^4.1.1, no patch
+#      (ci4/variant-f.patch, samples/litert/flutter only). Earlier D/E notes below are history.
+# Throwaway CI (no PR), 2026-11-11: the sample on Linux arm64 with qualcomm_npu: true exactly
+# as it ships (no CI-only override), so flutter_edge_ai_litertlm's qualcomm_npu hook downloads
+# QAIRT. A GitHub arm64 runner has no Qualcomm NPU: this checks the build and the bundle with
+# the hook on, not NPU execution.
+#   A  the sample as on origin/main (3.9.3 + patch, tool/flutter_litert/vendor.sh)
+#   E  flutter_litert ^4.1.0, FLUTTER_LITERT_BUNDLE_DESKTOP_RUNTIME OFF (ci4/variant-e.patch)
+name: sasha-arm64-qnn
+
+# A new workflow file can be dispatched only once it is on the default branch, so this one
+# runs on a push to this branch that touches it or the probe.
+on:
+  push:
+    branches: [ci/sasha-sample-411]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sasha-arm64-qnn
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: 3.47.3
+  NO_XIPH_LIBS: '1'
+  GEMMA_REPO: litert-community/gemma-4-E2B-it-litert-lm
+  GEMMA_COMMIT: 3d48132a00cf76de57d926de30f5c5c5ed9b8c0d
+  GEMMA_FILE: gemma-4-E2B-it.litertlm
+  GEMMA_SHA256: 181938105e0eefd105961417e8da75903eacda102c4fce9ce90f50b97139a63c
+
+jobs:
+  probe:
+    name: QAIRT probe (linux-arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: self
+          persist-credentials: false
+      - run: bash self/ci4/qairt-probe.sh probe
+
+  sample:
+    name: ${{ matrix.variant }} ${{ matrix.cfg.platform }}
+    needs: probe
+    runs-on: ${{ matrix.cfg.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        # One object per platform, so `only` can pick one without include rules.
+        cfg:
+          - {platform: linux-arm64, runner: ubuntu-24.04-arm, device: linux, release: build/linux/arm64/release/bundle, debug: build/linux/arm64/debug/bundle}
+        variant: [A, F]
+    defaults:
+      run:
+        shell: bash
+        working-directory: ls/samples/litert/flutter
+    steps:
+      - name: No CRLF conversion on checkout (Windows)
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+        working-directory: .
+      - name: Checkout google-ai-edge/litert-samples at 6bfa91e
+        uses: actions/checkout@v4
+        with:
+          repository: google-ai-edge/litert-samples
+          ref: 6bfa91e689c657c54aeba2fcb9bbfaf7870d276d
+          path: ls
+          persist-credentials: false
+          sparse-checkout: |
+            samples/litert/flutter
+      - name: Checkout this branch (ci4 scripts and patches)
+        uses: actions/checkout@v4
+        with:
+          path: self
+          persist-credentials: false
+
+      - name: Runner facts
+        run: |
+          uname -a; df -h . || true
+          if [ "$RUNNER_OS" = Linux ]; then nproc; free -g; ldd --version | head -1; lscpu | grep -E 'Model name|^CPU\(s\)'; fi
+          if [ "$RUNNER_OS" = Windows ]; then powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfLogicalProcessors"; fi
+          git -C "$GITHUB_WORKSPACE/ls" log -1 --format='%H %s'
+
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q git curl unzip xz-utils patch python3-venv clang cmake ninja-build pkg-config lld \
+            libgtk-3-dev liblzma-dev libstdc++-12-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libasound2-dev libturbojpeg pulseaudio-utils gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            libvulkan1 vulkan-tools mesa-vulkan-drivers xvfb
+          free=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+          if [ "$free" -lt 40 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          fi
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Flutter ${{ env.FLUTTER_VERSION }}
+        run: |
+          git clone -q --depth 1 --branch "$FLUTTER_VERSION" https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/flutter/bin:$PATH"
+          flutter config --no-analytics --no-cli-animations >/dev/null
+          flutter --version
+          flutter doctor -v || true
+
+      - name: Variant ${{ matrix.variant }}
+        id: prep
+        continue-on-error: true
+        run: |
+          set -eo pipefail
+          case "${{ matrix.variant }}" in
+            A) tool/flutter_litert/vendor.sh ;;
+            F) git -C "$GITHUB_WORKSPACE/ls" apply "$GITHUB_WORKSPACE/self/ci4/variant-f.patch" ;;
+          esac
+          git status --short .
+          git diff -- pubspec.yaml lib linux/CMakeLists.txt windows/CMakeLists.txt
+          if [ "${{ matrix.variant }}" != A ]; then
+            # The sample folder's tree, to compare with the local Sasha branch's
+            # (E: 2a3e6d07745a502c0c42c80092418ad99a335dd8). Staged, so the lock
+            # diff after pub get is against this tree.
+            git add -A .
+            echo "SAMPLE_TREE ${{ matrix.variant }} $(git write-tree --prefix=samples/litert/flutter/)"
+          fi
+
+      - name: qualcomm_npu as the sample ships it (no override)
+        run: |
+          grep -n -A4 '^hooks:' pubspec.yaml
+          grep -q '^      qualcomm_npu: true$' pubspec.yaml && echo "QNN_SETTING ${{ matrix.variant }} qualcomm_npu true (as shipped)"
+
+      - name: flutter pub get
+        id: pubget
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          flutter pub get 2>&1 | tee "$RUNNER_TEMP/pubget.log"
+          rc=${PIPESTATUS[0]}
+          echo "=== resolved ==="
+          for p in flutter_litert flutter_edge_ai flutter_edge_ai_litertlm flutter_edge_ai_speech flutter_edge_ai_rag flutter_edge_ai_agent flutter_edge_ai_sqlite; do
+            awk -v p="  $p:" '$0==p{f=1;print;next} f&&/^  [^ ]/{f=0} f' pubspec.lock
+          done
+          echo "=== pubspec.lock diff ==="
+          git diff -- pubspec.lock
+          exit $rc
+
+      - name: Models cache
+        uses: actions/cache@v4
+        with:
+          path: ls/samples/litert/flutter/assets/models
+          key: ci4-models-${{ hashFiles('ls/samples/litert/flutter/tool/models.lock') }}
+          enableCrossOsArchive: true
+
+      - name: tool/fetch_models.sh
+        id: models
+        continue-on-error: true
+        env:
+          PYTHON: python
+        run: tool/fetch_models.sh
+
+      - name: QAIRT probe right before the build (same runner)
+        run: bash "$GITHUB_WORKSPACE/self/ci4/qairt-probe.sh" build-${{ matrix.variant }}
+
+      - name: Desktop release build
+        id: build
+        continue-on-error: true
+        run: |
+          set +e +o pipefail
+          flutter build ${{ matrix.cfg.device }} --release -v > "$RUNNER_TEMP/build.log" 2>&1
+          rc=$?
+          echo "=== build exit $rc, $(wc -l < "$RUNNER_TEMP/build.log") log lines ==="
+          echo "=== flutter_litert / BUNDLE_DESKTOP_RUNTIME / downloads / CMake warnings ==="
+          grep -nE 'FLUTTER_LITERT|flutter_litert:|[Dd]ownload|CMake Warning|warning:.*litert' "$RUNNER_TEMP/build.log" | cut -c1-400 | head -n 80
+          echo "=== Qualcomm / QNN / QAIRT lines ==="
+          grep -niE 'qualcomm|qnn|qairt|softwarecenter|htp' "$RUNNER_TEMP/build.log" | cut -c1-400 | head -n 80
+          [ $rc -eq 0 ] || tail -n 80 "$RUNNER_TEMP/build.log"
+          exit $rc
+
+      - name: Native libraries (release bundle, packages, build tree)
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e +o pipefail
+          pc=${PUB_CACHE:-$HOME/.pub-cache}
+          if [ ! -d "$pc" ] && [ -n "${LOCALAPPDATA:-}" ]; then pc=$(cygpath -u "$LOCALAPPDATA")/Pub/Cache; fi
+          L="$GITHUB_WORKSPACE/self/ci4/list-libs.sh"
+          bash "$L" bundle "${{ matrix.cfg.release }}"
+          bash "$L" pubcache "$pc"/hosted/pub.dev/flutter_litert-* "$pc"/hosted/pub.dev/flutter_edge_ai_litertlm-*
+          bash "$L" vendored third_party/flutter_litert
+          bash "$L" native_assets build/native_assets .dart_tool
+          bash "$L" buildtree build
+          du -sh "${{ matrix.cfg.release }}" "${{ matrix.cfg.release }}"/lib 2>/dev/null || true
+          echo "BUNDLE_KB ${{ matrix.variant }} ${{ matrix.cfg.platform }} $(du -sk "${{ matrix.cfg.release }}" | cut -f1)"
+          du -sh "${{ matrix.cfg.release }}"/*.dll 2>/dev/null | sort -h | tail -n 40 || true
+          echo "=== flutter_litert 4.1.0 package files after the build (downloads land here) ==="
+          ls -l "$pc"/hosted/pub.dev/flutter_litert-*/linux/lib "$pc"/hosted/pub.dev/flutter_litert-*/windows "$pc"/hosted/pub.dev/flutter_litert-*/windows/lib 2>/dev/null || true
+          echo "=== vcruntime anywhere in the packages ==="
+          find "$pc"/hosted/pub.dev -iname 'vcruntime*' 2>/dev/null | while IFS= read -r f; do echo "VCR $(wc -c <"$f" | tr -d ' ') $(sha256sum "$f" | cut -c1-64) $f"; done
+          if [ "$RUNNER_OS" = Linux ]; then
+            echo "=== ELF class and machine of every file in bundle/lib ==="
+            for f in "${{ matrix.cfg.release }}"/lib/* "${{ matrix.cfg.release }}"/litert_edge_demos; do
+              [ -f "$f" ] || continue
+              cls=$(readelf -h "$f" 2>/dev/null | sed -n 's/^ *Class: *//p')
+              [ -n "$cls" ] || { echo "ELFH notelf $f"; continue; }
+              echo "ELFH $cls | $(readelf -h "$f" | sed -n 's/^ *Machine: *//p') | $(wc -c <"$f" | tr -d ' ') $(basename "$f")"
+            done
+          fi
+
+      - name: Qualcomm / QNN files (bundle, packages, build tree)
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e +o pipefail
+          pc=${PUB_CACHE:-$HOME/.pub-cache}
+          for d in "${{ matrix.cfg.release }}" build/native_assets "$pc"/hosted/pub.dev/flutter_litert-* "$pc"/hosted/pub.dev/flutter_edge_ai_litertlm-* third_party/flutter_litert; do
+            [ -e "$d" ] || continue
+            find "$d" -type f \( -iname '*qnn*' -o -iname '*qualcomm*' -o -iname '*htp*' -o -iname '*qairt*' -o -iname '*Dispatch*' -o -iname '*hexagon*' -o -iname '*dsp*' \) 2>/dev/null | sort | while IFS= read -r f; do
+              echo "QNNF ${{ matrix.variant }} $(wc -c <"$f" | tr -d ' ') $(sha256sum "$f" | cut -c1-64) $f"
+            done
+          done
+          echo "=== every file in the release bundle lib ==="
+          ls -l "${{ matrix.cfg.release }}"/lib
+
+      - name: GPU facts
+        if: always()
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then vulkaninfo --summary 2>&1 | head -n 60 || true
+          else powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | Format-List Name,DriverVersion,AdapterCompatibility" || true; fi
+
+      - name: detector_bundled_test (CPU)
+        id: det_cpu
+        continue-on-error: true
+        timeout-minutes: 45
+        run: bash "$GITHUB_WORKSPACE/self/ci4/run-it.sh" det-cpu ${{ matrix.cfg.device }} integration_test/detector_bundled_test.dart --dart-define=DETECTOR_BACKEND=cpu
+
+      - name: detector_bundled_test (GPU)
+        id: det_gpu
+        continue-on-error: true
+        timeout-minutes: 30
+        run: bash "$GITHUB_WORKSPACE/self/ci4/run-it.sh" det-gpu ${{ matrix.cfg.device }} integration_test/detector_bundled_test.dart --dart-define=DETECTOR_BACKEND=gpu
+
+      - name: Gemma cache
+        uses: actions/cache@v4
+        with:
+          path: gemma
+          key: ci4-gemma-${{ env.GEMMA_COMMIT }}
+          enableCrossOsArchive: true
+
+      - name: Gemma 4 E2B (public, no login)
+        id: gemma
+        continue-on-error: true
+        working-directory: .
+        run: |
+          set -e
+          f="gemma/$GEMMA_FILE"
+          if [ -f "$f" ] && [ "$(sha256sum "$f" | awk '{print $1}')" = "$GEMMA_SHA256" ]; then
+            echo "cached $f"
+          else
+            mkdir -p gemma
+            curl -fsSL --retry 3 -o "$f" "https://huggingface.co/$GEMMA_REPO/resolve/$GEMMA_COMMIT/$GEMMA_FILE"
+            got=$(sha256sum "$f" | awk '{print $1}')
+            [ "$got" = "$GEMMA_SHA256" ] || { echo "sha256 $got, want $GEMMA_SHA256"; rm -f "$f"; exit 1; }
+          fi
+          ls -l "$f"
+          root=$(cygpath -m "$GITHUB_WORKSPACE" 2>/dev/null || printf '%s' "$GITHUB_WORKSPACE")
+          echo "GEMMA_PATH=$root/$f" >> "$GITHUB_ENV"
+          df -h . || true
+
+      - name: detector_coex_test (detector CPU, Gemma CPU)
+        id: coex
+        if: steps.gemma.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 45
+        run: bash "$GITHUB_WORKSPACE/self/ci4/run-it.sh" coex-cpu ${{ matrix.cfg.device }} integration_test/detector_coex_test.dart --dart-define=GEMMA_MODEL_PATH="$GEMMA_PATH" --dart-define=DETECTOR_BACKEND=cpu --dart-define=GEMMA_BACKEND=cpu
+
+      - name: Native libraries (debug bundle the tests ran)
+        if: always()
+        run: bash "$GITHUB_WORKSPACE/self/ci4/list-libs.sh" debug "${{ matrix.cfg.debug }}"
+
+      - name: Outcomes
+        if: always()
+        run: |
+          cat <<EOF | tee -a "$GITHUB_STEP_SUMMARY"
+          OUTCOME ${{ matrix.variant }} ${{ matrix.cfg.platform }} prep=${{ steps.prep.outcome }} pubget=${{ steps.pubget.outcome }} models=${{ steps.models.outcome }} build=${{ steps.build.outcome }} det_cpu=${{ steps.det_cpu.outcome }} det_gpu=${{ steps.det_gpu.outcome }} gemma=${{ steps.gemma.outcome }} coex=${{ steps.coex.outcome }}
+          EOF
+
